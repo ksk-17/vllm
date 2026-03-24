@@ -5562,6 +5562,7 @@ class GPUModelRunner(
             all_random=False,
             top_p=dummy_tensors(0.9),
             top_k=dummy_tensors(logits.size(1) - 1),
+            top_a=dummy_tensors(0.5),
             generators={},
             max_num_logprobs=None,
             no_penalties=True,
