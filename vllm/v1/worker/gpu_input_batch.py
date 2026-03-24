@@ -187,6 +187,12 @@ class InputBatch:
         self.top_k_cpu = self.top_k_cpu_tensor.numpy()
         self.top_k_reqs: set[str] = set()
 
+        self.top_a = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
+        self.top_a_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
+        self.top_a_cpu = self.top_a_cpu_tensor.numpy()
+        self.top_a_reqs: set[str] = set()
+
         # Frequency penalty related data structures
         self.frequency_penalties = torch.empty(
             (max_num_reqs,), dtype=torch.float, device=device
@@ -371,6 +377,9 @@ class InputBatch:
             else:
                 top_k = self.vocab_size
             self.top_k_cpu[req_index] = top_k
+            self.top_a_cpu[req_index] = sampling_params.top_a
+            if sampling_params.top_a < 1:
+                self.top_a_reqs.add(req_id)
             self.frequency_penalties_cpu[req_index] = sampling_params.frequency_penalty
             if sampling_params.frequency_penalty != 0.0:
                 self.frequency_penalties_reqs.add(req_id)
@@ -516,6 +525,7 @@ class InputBatch:
         self.random_reqs.discard(req_id)
         self.top_p_reqs.discard(req_id)
         self.top_k_reqs.discard(req_id)
+        self.top_a_reqs.discard(req_id)
         self.frequency_penalties_reqs.discard(req_id)
         self.presence_penalties_reqs.discard(req_id)
         self.repetition_penalties_reqs.discard(req_id)
@@ -615,6 +625,7 @@ class InputBatch:
         )
         self.top_p_cpu[i1], self.top_p_cpu[i2] = self.top_p_cpu[i2], self.top_p_cpu[i1]
         self.top_k_cpu[i1], self.top_k_cpu[i2] = self.top_k_cpu[i2], self.top_k_cpu[i1]
+        self.top_a_cpu[i1], self.top_a_cpu[i2] = self.top_a_cpu[i2], self.top_a_cpu[i1]
         self.frequency_penalties_cpu[i1], self.frequency_penalties_cpu[i2] = (
             self.frequency_penalties_cpu[i2],
             self.frequency_penalties_cpu[i1],
@@ -743,6 +754,7 @@ class InputBatch:
             self.temperature_cpu[empty_index] = self.temperature_cpu[last_req_index]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
             self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
+            self.top_a_cpu[empty_index] = self.top_a_cpu[last_req_index]
             self.frequency_penalties_cpu[empty_index] = self.frequency_penalties_cpu[
                 last_req_index
             ]
@@ -807,6 +819,8 @@ class InputBatch:
             copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
         if not self.no_top_k:
             copy_slice(self.top_k_cpu_tensor, self.top_k, num_reqs)
+        if not self.no_top_a:
+            copy_slice(self.top_a_cpu_tensor, self.top_a, num_reqs)
 
         if not self.no_penalties:
             # Since syncing these tensors is expensive only copy them
@@ -865,6 +879,7 @@ class InputBatch:
             all_random=self.all_random,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
+            top_a=None if self.no_top_a else self.top_a[:num_reqs],
             generators=self.generators,
             max_num_logprobs=self.max_num_logprobs,
             prompt_token_ids=prompt_token_ids,
@@ -1038,6 +1053,10 @@ class InputBatch:
     @property
     def no_top_k(self) -> bool:
         return len(self.top_k_reqs) == 0
+    
+    @property
+    def no_top_a(self) -> bool:
+        return len(self.top_a_reqs) == 0
 
     @property
     def no_penalties(self) -> bool:

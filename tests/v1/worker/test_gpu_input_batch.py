@@ -22,9 +22,11 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 VOCAB_SIZE = 1024
 NUM_OUTPUT_TOKENS = 20
 MAX_PROMPT_SIZE = 100
+_device_type = current_platform.device_type or "cpu"
+_device_count = current_platform.device_count() if callable(getattr(current_platform, "device_count", None)) else torch.cuda.device_count()
 CUDA_DEVICES = [
-    f"{current_platform.device_type}:{i}"
-    for i in range(min(current_platform.device_count(), 2))
+    f"{_device_type}:{i}"
+    for i in range(1 if _device_count <= 1 else 2)
 ]
 MAX_NUM_PROMPT_TOKENS = 64
 
@@ -105,6 +107,7 @@ def _construct_expected_sampling_metadata(
     repetition_penalties = [1.0 for _ in range(num_reqs)]
     top_k = [0 for _ in range(num_reqs)]
     top_p = [0.0 for _ in range(num_reqs)]
+    top_a = [0.0 for _ in range(num_reqs)]
     temperature = [0.0 for _ in range(num_reqs)]
     min_tokens = {}
     logit_bias = [None] * num_reqs
@@ -152,6 +155,9 @@ def _construct_expected_sampling_metadata(
         top_k=None
         if all(x == 0 for x in top_k)
         else torch.tensor(top_k, dtype=torch.int, device=device),
+        top_a=None
+        if all(x == 0 for x in top_a)
+        else torch.tensor(top_a, dtype=torch.int, device=device),
         generators={},
         max_num_logprobs=0,
         prompt_token_ids=make_tensor_with_pad(

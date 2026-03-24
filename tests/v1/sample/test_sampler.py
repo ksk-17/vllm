@@ -19,7 +19,6 @@ VOCAB_SIZE = 1024
 NUM_OUTPUT_TOKENS = 20
 _device_type = current_platform.device_type or "cpu"
 _device_count = current_platform.device_count() if callable(getattr(current_platform, "device_count", None)) else torch.cuda.device_count()
-
 CUDA_DEVICES = [
     f"{_device_type}:{i}"
     for i in range(1 if _device_count <= 1 else 2)

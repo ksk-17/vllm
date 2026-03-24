@@ -196,6 +196,10 @@ class SamplingParams(
     top_k: int = 0
     """Controls the number of top tokens to consider. Set to 0 (or -1) to
     consider all tokens."""
+    top_a: float = 0.0
+    """Controls the adaptive threshold for token filtering based on the
+    dominant token probability. Tokens with probability below
+    top_a * max_prob^2 are filtered out. Set to 0.0 to disable."""
     min_p: float = 0.0
     """Represents the minimum probability for a token to be considered,
     relative to the probability of the most likely token. Must be in [0, 1].
@@ -299,6 +303,7 @@ class SamplingParams(
         temperature: float | None = 1.0,
         top_p: float | None = 1.0,
         top_k: int = 0,
+        top_a: float | None = 0.0,
         min_p: float = 0.0,
         seed: int | None = None,
         stop: str | list[str] | None = None,
@@ -339,6 +344,7 @@ class SamplingParams(
             temperature=1.0 if temperature is None else temperature,
             top_p=1.0 if top_p is None else top_p,
             top_k=top_k,
+            top_a=0.0 if top_a is None else top_a,
             min_p=min_p,
             seed=seed,
             stop=stop,
@@ -404,6 +410,7 @@ class SamplingParams(
             # Zero temperature means greedy sampling.
             self.top_p = 1.0
             self.top_k = 0
+            self.top_a = 0.0
             self.min_p = 0.0
             self._verify_greedy_sampling()
 
@@ -445,6 +452,12 @@ class SamplingParams(
                 f"top_p must be in (0, 1], got {self.top_p}.",
                 parameter="top_p",
                 value=self.top_p,
+            )
+        if not 0.0 <= self.top_a <= 1.0:
+            raise VLLMValidationError(
+                f"top_a must be in [0, 1], got {self.top_a}.",
+                parameter="top_a",
+                value=self.top_a,
             )
         # quietly accept -1 as disabled, but prefer 0
         if self.top_k < -1:
@@ -853,6 +866,7 @@ class SamplingParams(
             f"temperature={self.temperature}, "
             f"top_p={self.top_p}, "
             f"top_k={self.top_k}, "
+            f"top_a={self.top_a}, "
             f"min_p={self.min_p}, "
             f"seed={self.seed}, "
             f"stop={self.stop}, "
@@ -878,6 +892,7 @@ class SamplingParams(
             temperature=0.9,
             top_p=0.9,
             top_k=50,
+            top_a=0.5,
             min_p=0.1,
             frequency_penalty=0.5,
             presence_penalty=0.5,
