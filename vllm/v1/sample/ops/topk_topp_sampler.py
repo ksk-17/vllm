@@ -97,6 +97,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        a: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
@@ -104,6 +105,8 @@ class TopKTopPSampler(nn.Module):
         The logits tensor may be updated in-place.
         """
         logits = apply_top_k_top_p(logits, k, p)
+        if a is not None:
+            logits = apply_top_a(logits, a)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
@@ -241,6 +244,28 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     q.exponential_()
     return probs.div(q).argmax(dim=-1).view(-1)
 
+def apply_top_a(
+    logits: torch.Tensor,
+    a: torch.Tensor,
+) -> torch.Tensor:
+    # Only process requests where top_a > 0
+    if not (a > 0.0).any():
+        return logits
+
+    # Softmax to get probabilities for threshold computation
+    probs = torch.softmax(logits, dim=-1)
+
+    # Max probability per request: shape (num_tokens, 1)
+    p_max = probs.max(dim=-1, keepdim=True).values
+
+    # Adaptive threshold: top_a * p_max^2, shape (num_tokens, 1)
+    threshold = a.unsqueeze(1) * (p_max ** 2)
+
+    # Mask tokens below threshold — only for requests with a > 0
+    active = (a > 0.0).unsqueeze(1)   # (num_tokens, 1)
+    mask   = active & (probs < threshold)
+    logits = logits.masked_fill(mask, -float("inf"))
+    return logits
 
 def apply_top_k_top_p(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None

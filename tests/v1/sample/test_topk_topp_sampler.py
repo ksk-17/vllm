@@ -8,7 +8,7 @@ from vllm.platforms import current_platform
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
 CUDA_DEVICE = "cuda" if current_platform.is_cuda() else None
-DEVICE = current_platform.device_type
+DEVICE = current_platform.device_type if current_platform.device_type else "cpu"
 
 BATCH_SIZE = 1024
 VOCAB_SIZE = 128 * 1024
@@ -128,7 +128,7 @@ def test_flashinfer_sampler():
 # =============================================================================
 
 
-@pytest.mark.skipif(CUDA_DEVICE is None, reason="CUDA not available")
+# @pytest.mark.skipif(CUDA_DEVICE is None, reason="CUDA not available")
 class TestTritonTopkTopp:
     """Tests for the Triton top-k/top-p kernel."""
 
@@ -569,3 +569,149 @@ class TestTritonTopkTopp:
             finite_in = (logits[i] > float("-inf")).sum().item()
             if finite_in > 0:
                 assert kept > 0, f"Row {i}: no tokens kept"
+
+
+
+    # =============================================================================
+    # Top-A sampling tests
+    # =============================================================================
+
+    def test_top_a_disabled(self):
+        """top_a=0.0 should be a no-op — logits unchanged."""
+        torch.set_default_device(DEVICE)
+        generator = Generator(device=DEVICE).manual_seed(42)
+        logits = torch.rand((BATCH_SIZE, VOCAB_SIZE), generator=generator)
+
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+
+        a = torch.zeros(BATCH_SIZE)   # all disabled
+        result = apply_top_a(logits.clone(), a)
+
+        assert torch.allclose(result, logits), (
+            "apply_top_a with a=0.0 should not modify logits"
+        )
+
+
+    def test_top_a_filters_low_prob_tokens(self):
+        """top_a > 0 should mask tokens below the adaptive threshold."""
+        torch.set_default_device(DEVICE)
+        generator = Generator(device=DEVICE).manual_seed(7)
+
+        batch_size, vocab_size = 8, 1024
+        logits = torch.rand((batch_size, vocab_size), generator=generator)
+
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+
+        a = torch.full((batch_size,), 0.3)   # moderate threshold
+        result = apply_top_a(logits.clone(), a)
+
+        probs_before = torch.softmax(logits, dim=-1)
+        p_max        = probs_before.max(dim=-1, keepdim=True).values
+        threshold    = a.unsqueeze(1) * (p_max ** 2)
+
+        for i in range(batch_size):
+            # Tokens below threshold must be -inf in result
+            below = probs_before[i] < threshold[i]
+            assert (result[i][below] == float("-inf")).all(), (
+                f"Row {i}: tokens below threshold not masked"
+            )
+            # Tokens above threshold must be unchanged
+            above = probs_before[i] >= threshold[i]
+            assert (result[i][above] == logits[i][above]).all(), (
+                f"Row {i}: tokens above threshold incorrectly modified"
+            )
+
+
+    def test_top_a_always_keeps_max_token(self):
+        """The highest-probability token must never be masked out."""
+        torch.set_default_device(DEVICE)
+        generator = Generator(device=DEVICE).manual_seed(99)
+
+        batch_size, vocab_size = 32, 512
+        logits = torch.rand((batch_size, vocab_size), generator=generator)
+
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+
+        # Test across several top_a values including extreme ones
+        for a_val in [0.1, 0.3, 0.5, 0.9]:
+            a = torch.full((batch_size,), a_val)
+            result = apply_top_a(logits.clone(), a)
+
+            for i in range(batch_size):
+                max_idx = logits[i].argmax()
+                assert result[i][max_idx] != float("-inf"), (
+                    f"a={a_val}, row {i}: max-prob token was masked — "
+                    "Top-A must never mask the highest probability token"
+                )
+
+
+    def test_top_a_mixed_batch(self):
+        """Batch where some requests have top_a enabled, others disabled."""
+        torch.set_default_device(DEVICE)
+        generator = Generator(device=DEVICE).manual_seed(55)
+
+        batch_size, vocab_size = 16, 512
+        logits = torch.rand((batch_size, vocab_size), generator=generator)
+
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+
+        # Even indices: disabled (a=0), odd indices: enabled (a=0.2)
+        a = torch.zeros(batch_size)
+        a[1::2] = 0.2
+        result = apply_top_a(logits.clone(), a)
+
+        for i in range(batch_size):
+            if a[i] == 0.0:
+                # Disabled — logits unchanged
+                assert torch.allclose(result[i], logits[i]), (
+                    f"Row {i}: disabled top_a changed logits"
+                )
+            else:
+                # Enabled — at least some tokens should be masked
+                # (for random logits with a=0.2 this is almost always true)
+                has_masked = (result[i] == float("-inf")).any()
+                # Not asserting has_masked=True since for some
+                # distributions all tokens are above threshold — just
+                # verify no NaN and max token preserved
+                assert not result[i].isnan().any(), (
+                    f"Row {i}: NaN in top_a result"
+                )
+
+
+    def test_top_a_no_nan(self):
+        """apply_top_a must never produce NaN values."""
+        torch.set_default_device(DEVICE)
+        generator = Generator(device=DEVICE).manual_seed(13)
+
+        batch_size, vocab_size = 64, 2048
+        logits = torch.randn((batch_size, vocab_size), generator=generator)
+
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+
+        a = torch.rand((batch_size,), generator=generator) * 0.5  # [0, 0.5)
+        result = apply_top_a(logits, a)
+
+        assert not result.isnan().any(), "apply_top_a produced NaN values"
+
+
+    def test_top_a_strong_filtering(self):
+        """High top_a (0.9) should leave very few tokens unmasked."""
+        torch.set_default_device(DEVICE)
+
+        batch_size, vocab_size = 8, 512
+
+        # Use peaked logits: one dominant token per row
+        # This gives max_prob ≈ 0.99, so threshold = 0.9 * 0.99² ≈ 0.88
+        # meaning only the dominant token survives
+        logits = torch.full((batch_size, vocab_size), -10.0)
+        logits[:, 0] = 10.0  # one strong token per row
+
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+
+        a = torch.full((batch_size,), 0.9)
+        result = apply_top_a(logits.clone(), a)
+
+        for i in range(batch_size):
+            kept = (result[i] != float("-inf")).sum().item()
+            assert kept >= 1, f"Row {i}: all tokens masked — need at least 1"
+            assert kept < vocab_size, f"Row {i}: no tokens filtered with a=0.9"

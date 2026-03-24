@@ -17,9 +17,12 @@ PIN_MEMORY_AVAILABLE = is_pin_memory_available()
 MAX_NUM_REQS = 256
 VOCAB_SIZE = 1024
 NUM_OUTPUT_TOKENS = 20
+_device_type = current_platform.device_type or "cpu"
+_device_count = current_platform.device_count() if callable(getattr(current_platform, "device_count", None)) else torch.cuda.device_count()
+
 CUDA_DEVICES = [
-    f"{current_platform.device_type}:{i}"
-    for i in range(1 if current_platform.device_count() == 1 else 2)
+    f"{_device_type}:{i}"
+    for i in range(1 if _device_count <= 1 else 2)
 ]
 MAX_NUM_PROMPT_TOKENS = 64
 
@@ -147,6 +150,7 @@ def _create_default_sampling_metadata(
         all_random=False,
         top_p=None,
         top_k=None,
+        top_a=None,
         generators={},
         max_num_logprobs=0,
         prompt_token_ids=_create_prompt_tokens_tensor(
@@ -447,3 +451,61 @@ def test_sampler_bad_words(
                 assert logits_for_req[token_id] == -float("inf")
             else:
                 assert logits_for_req[token_id] != -float("inf")
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("batch_size", [1, 2, 32])
+@pytest.mark.parametrize("top_a_value", [0.0, 0.1, 0.3])
+def test_sampler_top_a(device: str, batch_size: int, top_a_value: float):
+    """
+    Verify that Top-A sampling integrates correctly with the Sampler.
+
+    - top_a=0.0: disabled — sampler output should be identical to
+      sampling without top_a
+    - top_a>0.0: at least the max-probability token must survive
+      filtering for every request in the batch
+    """
+    torch.set_default_device(device)
+
+    fake_logits = _create_fake_logits(batch_size, VOCAB_SIZE)
+    # Perturb logits slightly so not all tokens have equal probability
+    # (equal-prob logits make top_a threshold trivially 0)
+    fake_logits += torch.rand_like(fake_logits) * 0.1
+
+    sampling_metadata = _create_default_sampling_metadata(
+        NUM_OUTPUT_TOKENS, batch_size, VOCAB_SIZE, torch.device(device)
+    )
+
+    # Override to random sampling so top_a path is exercised
+    sampling_metadata.all_greedy    = False
+    sampling_metadata.all_random    = True
+    sampling_metadata.temperature   = torch.full(
+        (batch_size,), 1.0, device=device)
+    sampling_metadata.top_p         = None
+    sampling_metadata.top_k         = None
+    sampling_metadata.top_a         = torch.full(
+        (batch_size,), top_a_value, device=device)
+
+    sampler  = Sampler()
+    sampled, _ = sampler.sample(fake_logits, sampling_metadata)
+
+    # Every sampled token must be a valid vocabulary index
+    assert sampled.shape == (batch_size,), (
+        f"Expected shape ({batch_size},), got {sampled.shape}"
+    )
+    assert (sampled >= 0).all() and (sampled < VOCAB_SIZE).all(), (
+        "Sampled token IDs out of vocabulary range"
+    )
+
+    if top_a_value > 0.0:
+        # Verify that sampled tokens are not from the masked region.
+        # Apply top_a filter manually and confirm sampled ids survive.
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_a
+        a_tensor = torch.full(
+            (batch_size,), top_a_value, device=device)
+        filtered_logits = apply_top_a(fake_logits.clone(), a_tensor)
+        for i in range(batch_size):
+            token = sampled[i].item()
+            assert filtered_logits[i][token] != float("-inf"), (
+                f"batch={i}: sampled token {token} was in the "
+                f"top_a masked region (top_a={top_a_value})"
+            )

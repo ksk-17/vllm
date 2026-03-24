@@ -16,6 +16,7 @@ class SamplingMetadata:
 
     top_p: torch.Tensor | None
     top_k: torch.Tensor | None
+    top_a: torch.Tensor | None
 
     generators: dict[int, torch.Generator]
 
